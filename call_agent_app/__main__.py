@@ -30,6 +30,7 @@ from .audio_socket import AudioSocketBridge
 from .speech_pipeline import SipSpeechPipeline
 from .realtime_voice import OpenAIRealtimeVoiceSession
 from . import settings as settings_mod
+from .inherited_credential import InheritedCredential
 from .routes import build_routes
 from .wan_watch import WanAddressWatch
 
@@ -93,11 +94,17 @@ def _container_config() -> dict:
 
 def build_standalone_app() -> FastAPI:
     store = CallStore(default_data_dir())
-    pipeline = SipSpeechPipeline(lambda: settings_mod.resolve(_container_config()), store)
+    # Started/stopped in lifespan below. In standalone mode (no workspace,
+    # no AW_WORKSPACE_API_URL/KEY) it stays permanently inert — see
+    # InheritedCredential.refresh_now — settings.resolve() just gets an
+    # empty cache back from it, same as an unreachable step 3 file.
+    cred = InheritedCredential()
+    pipeline = SipSpeechPipeline(
+        lambda: settings_mod.resolve(_container_config(), cred), store)
     def duplex_factory(call_id, emit):
         return OpenAIRealtimeVoiceSession(
-            call_id, settings_mod.resolve(_container_config()), store, emit)
-    effective = settings_mod.resolve(_container_config())
+            call_id, settings_mod.resolve(_container_config(), cred), store, emit)
+    effective = settings_mod.resolve(_container_config(), cred)
     bridge = AudioSocketBridge(
         store,
         host=os.environ.get("ASTERISK_AUDIO_SOCKET_HOST", "127.0.0.1"),
@@ -121,9 +128,11 @@ def build_standalone_app() -> FastAPI:
     async def lifespan(_app):
         await bridge.start()
         await watch.start()
+        await cred.start()
         try:
             yield
         finally:
+            await cred.stop()
             await watch.stop()
             await bridge.stop()
             store.close()
@@ -139,7 +148,8 @@ def build_standalone_app() -> FastAPI:
         app.mount(f"/api/apps/{SLUG}/ui", StaticFiles(directory=UI_DIST), name="ui")
     routes = build_routes(config_provider=_container_config, call_store=store,
                           audio_bridge_provider=lambda: bridge,
-                          wan_watch=watch)
+                          wan_watch=watch,
+                          inherited_credential=cred)
     app.mount("/" if tier2 else f"/api/apps/{SLUG}", routes)
 
     @app.get("/")

@@ -95,6 +95,16 @@ class CallAgentError(RuntimeError):
     stack trace in a log nobody reads."""
 
 
+class CallAgentUnauthorized(CallAgentError):
+    """The configured credential was rejected (HTTP 401) by agents-platform.
+
+    Distinct from ``CallAgentError`` so ``CallAgentService.run_agent`` can
+    catch exactly this and retry once after refreshing the inherited
+    credential — an invalidated-but-unexpired token (the failure mode this
+    app actually hit) will not fix itself on its own schedule the way an
+    expiring one would."""
+
+
 @dataclass
 class CallSettings:
     """Effective settings for one call. Built by ``settings.resolve()``."""
@@ -151,10 +161,23 @@ class CallSettings:
 
 class CallAgentService:
     """Everything a call needs from Agents Platform. One instance per request
-    is fine — it holds no connection state, only settings."""
+    is fine — it holds no connection state, only settings.
 
-    def __init__(self, settings: CallSettings):
+    ``settings_provider`` and ``credential_refresher`` are both optional and
+    only used by the 401-retry path (see ``run_agent``): ``self.settings`` is
+    frozen at construction, so retrying with the *same* rejected token would
+    be pointless — ``credential_refresher`` (normally
+    ``InheritedCredential.refresh_now``) forces a fresh fetch, and
+    ``settings_provider`` (normally ``settings.resolve`` bound to the live
+    config + credential cache) re-reads the result before the retry.
+    """
+
+    def __init__(self, settings: CallSettings,
+                 settings_provider: Callable[[], CallSettings] | None = None,
+                 credential_refresher: Callable[[], Awaitable[None]] | None = None):
         self.settings = settings
+        self._settings_provider = settings_provider
+        self._credential_refresher = credential_refresher
 
     # ---- helpers -----------------------------------------------------------
 
@@ -194,8 +217,14 @@ class CallAgentService:
                         for a in agents if a.get("slug")]
                 return {"agents": rows or fallback["agents"]}
         except Exception as exc:
+            # This blanket except is what made the rejected-credential
+            # incident invisible for weeks: the picker looked populated the
+            # whole time. Keep the fallback row (the UI needs one) but mark
+            # the payload degraded so a caller — including the
+            # /credentials/check doctor probe — can tell "answered" apart
+            # from "answered with a lie".
             log.warning("Could not fetch agents list: %s", exc)
-            return fallback
+            return {**fallback, "degraded": True, "error": str(exc)}
 
     async def tts(self, text: str, lang: str = "") -> bytes:
         """Speech via the selected provider, returned as raw MP3.
@@ -262,8 +291,13 @@ class CallAgentService:
         slug = self.settings.target_slug
         try:
             resp = await client.get(f"/api/targets/{slug}")
+            if resp.status_code == 401:
+                raise CallAgentUnauthorized(
+                    "agents-platform rejected the configured credential (401)")
             if resp.status_code == 200:
                 return
+        except CallAgentUnauthorized:
+            raise
         except Exception as exc:
             log.debug("target probe failed for %s: %s", slug, exc)
         try:
@@ -275,10 +309,15 @@ class CallAgentService:
                 "source_kind": "manual",
                 "created_by": "call-agent",
             })
+            if resp.status_code == 401:
+                raise CallAgentUnauthorized(
+                    "agents-platform rejected the configured credential (401)")
             if resp.status_code in (200, 201, 409):
                 return
             log.warning("could not create target %s: %s %s", slug,
                         resp.status_code, resp.text[:200])
+        except CallAgentUnauthorized:
+            raise
         except Exception as exc:
             log.warning("could not create target %s: %s", slug, exc)
 
@@ -317,8 +356,7 @@ class CallAgentService:
                 continue
         return None
 
-    async def run_agent(self, prompt: str, claude_session_id: str | None) -> str:
-        """Start an agent run and return the run_id."""
+    async def _run_agent_once(self, prompt: str, claude_session_id: str | None) -> str:
         body: dict[str, Any] = {
             "input": {"input": prompt},
             "target_slug": self.settings.target_slug,
@@ -330,6 +368,9 @@ class CallAgentService:
             await self.ensure_target(client)
             resp = await client.post(
                 f"/api/agents/{self.settings.agent_slug}/run", json=body)
+            if resp.status_code == 401:
+                raise CallAgentUnauthorized(
+                    "agents-platform rejected the configured credential (401)")
             if resp.status_code == 404:
                 raise CallAgentError(
                     f"agent '{self.settings.agent_slug}' not found on "
@@ -337,6 +378,25 @@ class CallAgentService:
                     f"agent in this app's settings.")
             resp.raise_for_status()
             return resp.json()["run_id"]
+
+    async def run_agent(self, prompt: str, claude_session_id: str | None) -> str:
+        """Start an agent run and return the run_id.
+
+        Retries exactly once on a rejected credential: refresh the inherited
+        token, re-resolve settings (``self.client()`` reads ``self.settings``
+        live, so the retry picks the new one up automatically), then try
+        again. With no refresher/provider wired (standalone mode, or a
+        caller that doesn't need this), a 401 just propagates as before.
+        """
+        try:
+            return await self._run_agent_once(prompt, claude_session_id)
+        except CallAgentUnauthorized:
+            if self._credential_refresher is None:
+                raise
+            await self._credential_refresher()
+            if self._settings_provider is not None:
+                self.settings = self._settings_provider()
+            return await self._run_agent_once(prompt, claude_session_id)
 
     async def run_agent_with_heartbeat(
         self, prompt: str, claude_session_id: str | None,

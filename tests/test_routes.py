@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from call_agent_app import settings as settings_mod  # noqa: E402
 from call_agent_app.routes import build_routes  # noqa: E402
 from call_agent_app.service import (  # noqa: E402
-    CallAgentService, CallSettings, pick_edge_voice, strip_markdown,
+    CallAgentService, CallAgentUnauthorized, CallSettings, pick_edge_voice,
+    strip_markdown,
 )
 from call_agent_app.telephony import (  # noqa: E402
     AsteriskAMI, TelephonyError, TelephonySettings, normalise_e164,
@@ -181,6 +182,147 @@ def test_unconfigured_backend_errors_on_the_socket_not_in_a_log(monkeypatch):
         assert frame["type"] == "error"
         assert "agents-platform base URL" in frame["message"]
         assert ws.receive_json()["type"] == "ready"
+
+
+# ---- 401-retry (the other half of the credential-inheritance design) -------
+#
+# Split from test_inherited_credential.py on purpose: that file proves the
+# fetch-and-cache half, this proves refresh-on-401-and-retry-once. Mutating
+# either mechanism independently should break exactly one of the two files.
+
+def _targets_and_run_transport(run_handler):
+    """A MockTransport that answers /api/targets/* the same way every test
+    here needs, and defers only the final /run POST to ``run_handler``."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/api/targets/") and not path.endswith("/runs"):
+            return httpx.Response(404, json={"detail": "not found"})
+        if path == "/api/targets":
+            return httpx.Response(200, json={"slug": "x"})
+        if path.endswith("/run"):
+            return run_handler(request)
+        return httpx.Response(404, json={"detail": path})
+    return httpx.MockTransport(handler)
+
+
+def _patch_client(monkeypatch, transport):
+    real_client = CallAgentService.client
+
+    def patched(self, timeout: float = 30.0):
+        c = real_client(self, timeout=timeout)
+        c._transport = transport
+        return c
+
+    monkeypatch.setattr(CallAgentService, "client", patched)
+
+
+def test_run_agent_retries_once_on_401_then_succeeds(monkeypatch):
+    def run_handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization", "")
+        if "old-tok" in auth:
+            return httpx.Response(401, json={"detail": "unauthorized"})
+        assert "new-tok" in auth
+        return httpx.Response(200, json={"run_id": "run-2"})
+
+    _patch_client(monkeypatch, _targets_and_run_transport(run_handler))
+
+    old_settings = CallSettings(agents_platform_base="http://ap.test",
+                                agents_platform_token="old-tok",
+                                agent_slug="telegram-sonnet", external_id="test")
+    new_settings = CallSettings(agents_platform_base="http://ap.test",
+                                agents_platform_token="new-tok",
+                                agent_slug="telegram-sonnet", external_id="test")
+    refreshed = {"called": False}
+
+    async def refresher():
+        refreshed["called"] = True
+
+    svc = CallAgentService(old_settings, settings_provider=lambda: new_settings,
+                           credential_refresher=refresher)
+    run_id = asyncio.run(svc.run_agent("hi", None))
+
+    assert run_id == "run-2"
+    assert refreshed["called"] is True
+
+
+def test_run_agent_gives_up_after_the_retry_also_401s(monkeypatch):
+    def run_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _patch_client(monkeypatch, _targets_and_run_transport(run_handler))
+
+    settings = CallSettings(agents_platform_base="http://ap.test",
+                            agents_platform_token="dead-tok",
+                            agent_slug="telegram-sonnet", external_id="test")
+    calls = {"n": 0}
+
+    async def refresher():
+        calls["n"] += 1
+
+    svc = CallAgentService(settings, settings_provider=lambda: settings,
+                           credential_refresher=refresher)
+    with pytest.raises(CallAgentUnauthorized):
+        asyncio.run(svc.run_agent("hi", None))
+
+    assert calls["n"] == 1  # retried exactly once, not looped
+
+
+def test_run_agent_without_a_refresher_propagates_401_immediately(monkeypatch):
+    def run_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _patch_client(monkeypatch, _targets_and_run_transport(run_handler))
+
+    settings = CallSettings(agents_platform_base="http://ap.test",
+                            agents_platform_token="tok",
+                            agent_slug="telegram-sonnet", external_id="test")
+    svc = CallAgentService(settings)  # no settings_provider, no refresher
+    with pytest.raises(CallAgentUnauthorized):
+        asyncio.run(svc.run_agent("hi", None))
+
+
+# ---- /credentials/check + the doctor manifest entry that reaches it --------
+
+def test_credentials_check_is_http_200_with_ok_false_on_a_rejected_token(
+        monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/agents":
+            return httpx.Response(401, text="nope")
+        return httpx.Response(404, json={"detail": request.url.path})
+
+    _patch_client(monkeypatch, httpx.MockTransport(handler))
+
+    resp = TestClient(build_routes(config_provider=lambda: CONFIG)).get(
+        "/credentials/check")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == 401
+
+
+def test_credentials_check_reports_ok_on_a_working_token(client):
+    body = client.get("/credentials/check").json()
+    assert body["ok"] is True
+    assert body["status"] == 200
+
+
+def test_settings_surfaces_the_same_credentials_check(client):
+    body = client.get("/settings").json()
+    assert body["credentials_check"]["ok"] is True
+
+
+def test_manifest_doctor_route_is_actually_registered():
+    """``contributes.doctor`` names a route core will GET in-process
+    (``_app_doctor_checks``) — a typo there is invisible until doctor runs
+    against a real deploy and reports every check as 404."""
+    manifest = json.loads((Path(__file__).resolve().parent.parent
+                           / "aw-app.json").read_text())
+    doctor_routes = {c["route"] for c in manifest["contributes"]["doctor"]}
+    assert doctor_routes, "expected at least one contributes.doctor entry"
+    registered = {r.path for r in build_routes(config_provider=dict).routes}
+    for route in doctor_routes:
+        assert route in registered, f"{route!r} is not a registered route"
 
 
 # ---- ported pure helpers ----------------------------------------------------

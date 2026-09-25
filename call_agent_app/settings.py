@@ -8,20 +8,32 @@ user to paste a JWT into a second app just to make the first call is a
 setup step with no decision in it, so the resolution order is:
 
 1. this app's own config (``agents_platform_base`` / ``agents_platform_token``)
-   — set these to point calls at a *different* platform than the runners app;
+   — set these to point calls at a *different* platform than the runners app,
+   or as a break-glass override. A value here wins and is never refreshed;
 2. environment (``AW_AGENTS_PLATFORM_BASE`` / ``AW_AGENTS_PLATFORM_TOKEN``) —
    how standalone mode is configured, since there is no workspace config there;
-3. the runners app's saved config snapshot on disk.
+3. the runners app's saved config snapshot on disk, at
+   ``$AW_WORKSPACE_HOME/app-config/agents-platform-runners.json``. Correct
+   for standalone mode running directly on the workspace host; **unreachable
+   in this app's own Tier-2 container**, which mounts no app-config volume
+   and cannot even compute the right path there (no ``AW_WORKSPACE*`` var
+   reaches the container). Kept for the standalone case, not removed;
+4. ``inherited_credential.InheritedCredential``'s in-memory cache — the same
+   runners-app token, kept fresh by a background poll of
+   ``GET {AW_WORKSPACE_API_URL}/api/apps/agents-platform-runners/config``
+   over the workspace's own public API. This is what actually reaches the
+   Tier-2 container: see ``inherited_credential.py`` for why and how.
 
-(3) is a read of another app's file, which the capability model has no verb
-for — there is no ``config:read:<app>`` today, only ``config:extend:<app>``
-for writing. It is best-effort and read-only: the snapshot lives at
-``$AW_WORKSPACE_HOME/app-config/agents-platform-runners.json`` (written by
-core so an app's settings survive a delete/reinstall), a missing or
-unreadable file just leaves the field blank, and ``GET /settings`` reports
-which source won so a blank one is diagnosable. If the capability lands
-later, swap this function's body for it — nothing else in the app reads
-these values directly.
+Step 3 is a read of another app's file, which the capability model has no
+verb for — there is no ``config:read:<app>`` today, only
+``config:extend:<app>`` for writing; step 4 sidesteps that by asking the
+workspace's own API instead. Both are best-effort and read-only: a missing
+file or a failed fetch just leaves the field blank/stale, and
+``GET /settings`` reports which source won (``inherited:agents-platform-
+runners@api`` for step 4) so a blank one is diagnosable. If a
+``config:read:<app>`` capability lands later, step 3 could be simplified to
+use it — step 4 stays either way, since a Tier-2 container needs the HTTP
+path regardless.
 """
 
 from __future__ import annotations
@@ -68,8 +80,18 @@ def _num(value, default: float) -> float:
     return out if out > 0 else default
 
 
-def resolve(config: dict | None) -> CallSettings:
-    """Build the effective ``CallSettings`` for this workspace."""
+def resolve(config: dict | None, inherited=None) -> CallSettings:
+    """Build the effective ``CallSettings`` for this workspace.
+
+    ``inherited`` is an ``inherited_credential.InheritedCredential`` (or
+    anything with the same ``token()``/``base()`` cache-read methods) — kept
+    as a parameter rather than imported and constructed here so this
+    function stays pure and synchronous: it never performs I/O itself, only
+    reads whatever cache the caller already owns. Callers on the container
+    path (``__main__.py``) pass the live poller; a caller with none (tests,
+    standalone-without-a-poller) gets step 4 skipped, same as a step 3 file
+    miss.
+    """
     cfg = config or {}
     defaults = CallSettings()
 
@@ -87,12 +109,20 @@ def resolve(config: dict | None) -> CallSettings:
 
     if not base or not token:
         runners = _runners_config()
-        inherited_base = (runners.get("agents_platform_base") or "").strip()
-        inherited_token = (runners.get("agents_platform_token") or "").strip()
-        if inherited_base or inherited_token:
-            base = base or inherited_base
-            token = token or inherited_token
+        file_base = (runners.get("agents_platform_base") or "").strip()
+        file_token = (runners.get("agents_platform_token") or "").strip()
+        if file_base or file_token:
+            base = base or file_base
+            token = token or file_token
             source = f"inherited:{RUNNERS_APP_ID}"
+
+    if (not base or not token) and inherited is not None:
+        api_base = (inherited.base() or "").strip()
+        api_token = (inherited.token() or "").strip()
+        if api_base or api_token:
+            base = base or api_base
+            token = token or api_token
+            source = f"inherited:{RUNNERS_APP_ID}@api"
 
     if not base and not token:
         source = "unset"

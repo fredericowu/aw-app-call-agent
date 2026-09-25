@@ -1,5 +1,4 @@
-"""Entrypoint referenced by aw-app.json's runtime.entrypoint
-("call_agent_app.plugin:CallAgentAppPlugin").
+"""Entrypoint for standalone/in-process activation.
 
 All this app needs from the runtime is a mount point: ``ctx.routes.register``
 puts the sub-app from ``routes.py`` at ``/api/apps/call-agent`` behind
@@ -7,6 +6,14 @@ puts the sub-app from ``routes.py`` at ``/api/apps/call-agent`` behind
 ``ctx`` rather than snapshotted here, so saving new settings re-points the
 next call immediately instead of at the next workspace restart —
 ``on_config_saved`` therefore only has to log.
+
+Not loaded in production: ``aw-app.json`` declares ``"tier": "container"``
+with no ``runtime.entrypoint``, so core substitutes ``_ContainerPlugin`` for
+this class (``src/apps/runtime.py``) and the container's own
+``container/entrypoint.sh`` runs ``python -m call_agent_app`` — i.e.
+``__main__.py``, not this file. Anything that needs to run in the actual
+deployed app (the inherited-credential poller included) has to be wired
+there instead.
 """
 
 from __future__ import annotations

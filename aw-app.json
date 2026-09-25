@@ -94,6 +94,8 @@
       "AW_CALL_DEFAULT_VOICE_LANG": "${config.default_voice_lang}",
       "AW_CALL_POLL_INTERVAL": "${config.poll_interval_seconds}",
       "AW_CALL_MAX_POLL_SECONDS": "${config.max_poll_seconds}",
+      "AW_WORKSPACE_API_URL": "${env.AW_WORKSPACE_API_URL}",
+      "AW_WORKSPACE_API_KEY": "${env.AW_WORKSPACE_API_KEY}",
       "AW_TIER2_CONTAINER": "1"
     },
     "volumes": [
@@ -115,6 +117,12 @@
     "routes": [
       {
         "prefix": "/api/apps/call-agent"
+      }
+    ],
+    "doctor": [
+      {
+        "label": "Agents Platform credential",
+        "route": "/credentials/check"
       }
     ],
     "windows": [
@@ -246,7 +254,7 @@
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "Identity JWT sent as Authorization: Bearer to agents_platform_base. Required for SIP calls."
+        "description": "Break-glass override only. Normally leave this blank — the app inherits a fresh credential from the Agents Platform Runners app automatically. A value pasted here wins over that inheritance and is never refreshed, which is how this app's credential went stale and silent before; if a call fails after pasting one, clear it (save with this field empty) and let inheritance take over again."
       },
       "poll_interval_seconds": {
         "type": "number",

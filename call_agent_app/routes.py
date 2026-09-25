@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import struct
+import time
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -66,13 +67,20 @@ class SipIntegrationTestRequest(BaseModel):
 def build_routes(config_provider: Callable[[], dict] | None = None,
                  call_store: CallStore | None = None,
                  audio_bridge_provider: Callable[[], object] | None = None,
-                 wan_watch: object | None = None) -> FastAPI:
+                 wan_watch: object | None = None,
+                 inherited_credential: object | None = None) -> FastAPI:
     """Mode-agnostic factory.
 
     ``config_provider`` is read on **every** request rather than once at
     build time — a settings save updates ``ctx.config`` in place, and a
     snapshot taken at activation would keep dispatching calls to the old
     agent until the next workspace restart.
+
+    ``inherited_credential`` is an ``inherited_credential.InheritedCredential``
+    (started/stopped by the caller — ``__main__.py``) — passed through to
+    ``settings.resolve()`` as step 4 of its resolution order, and to
+    ``CallAgentService`` as the 401-retry's refresher. ``None`` in standalone
+    mode without a poller wired up; step 4 and the retry are just skipped.
     """
     app = FastAPI(title="call-agent")
     sip_test_jobs: dict[str, dict] = {}
@@ -84,7 +92,45 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
                 cfg = config_provider() or {}
             except Exception:
                 log.warning("config provider failed; using defaults", exc_info=True)
-        return settings_mod.resolve(cfg)
+        return settings_mod.resolve(cfg, inherited=inherited_credential)
+
+    def settings_for(agent_slug: str) -> CallSettings:
+        base = current()
+        return (base if agent_slug == base.agent_slug
+                else dataclasses.replace(base, agent_slug=agent_slug))
+
+    def service_for(s: CallSettings) -> CallAgentService:
+        """A ``CallAgentService`` wired for the 401-retry, when a poller is
+        available to refresh from. ``s.agent_slug`` is captured by value so
+        the retry's re-resolve keeps whichever agent this call is bound to."""
+        agent_slug = s.agent_slug
+        return CallAgentService(
+            s,
+            settings_provider=lambda: settings_for(agent_slug),
+            credential_refresher=(inherited_credential.refresh_now
+                                  if inherited_credential is not None else None))
+
+    async def credentials_check(s: CallSettings) -> dict:
+        """Same probe `/credentials/check` and doctor use — a real
+        ``GET /api/agents``, not a presence check. `/settings`'s old
+        ``has_token``/``credentials_source`` reported healthy throughout the
+        incident this exists to catch; a presence check is theatre."""
+        checked_at = time.time()
+        if not s.agents_platform_base:
+            return {"ok": False, "status": None, "checked_at": checked_at,
+                    "detail": "no agents-platform base URL configured"}
+        try:
+            async with service_for(s).client(timeout=10.0) as client:
+                resp = await client.get("/api/agents")
+        except Exception as exc:
+            return {"ok": False, "status": None, "checked_at": checked_at,
+                    "detail": str(exc)}
+        return {
+            "ok": resp.status_code == 200,
+            "status": resp.status_code,
+            "checked_at": checked_at,
+            "detail": "ok" if resp.status_code == 200 else resp.text[:200],
+        }
 
     def raw_config() -> dict:
         if config_provider is None:
@@ -133,6 +179,7 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
             # the only thing the UI needs to know.
             "has_token": bool(s.agents_platform_token),
             "credentials_source": s.source,
+            "credentials_check": await credentials_check(s),
             "poll_interval_seconds": s.poll_interval_seconds,
             "max_poll_seconds": s.max_poll_seconds,
             "telephony": {
@@ -144,6 +191,18 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
                 "missing": telephony().missing(),
             },
         }
+
+    @app.get("/credentials/check")
+    async def credentials_check_route() -> dict:
+        """``contributes.doctor``'s check for this app — always HTTP 200
+        (a rejected credential is a normal, expected outcome, not a route
+        failure) with ``ok`` carrying the real verdict. Core's doctor
+        aggregator (`_app_doctor_checks`) reports anything non-200 as a bare
+        "HTTP nnn" and discards the body, so the detail has to travel inside
+        a 200."""
+        s = current()
+        result = await credentials_check(s)
+        return {"source": s.source, **result}
 
     @app.get("/telephony/status")
     async def telephony_status() -> dict:
@@ -308,7 +367,7 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
             username, password, extension,
             port=int(os.environ.get("SIP_BIND_PORT") or 5060))
         try:
-            service = CallAgentService(current())
+            service = service_for(current())
             prompts = []
             for text in (request.first_text, request.follow_up_text):
                 mp3 = await service.tts(text, current().default_voice_lang)
@@ -466,12 +525,12 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
 
     @app.get("/agents-list")
     async def agents_list() -> dict:
-        return await CallAgentService(current()).agents_list()
+        return await service_for(current()).agents_list()
 
     @app.get("/tts")
     async def tts(text: str = Query(""), lang: str = Query("")):
         try:
-            audio = await CallAgentService(current()).tts(text, lang)
+            audio = await service_for(current()).tts(text, lang)
         except CallAgentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -494,7 +553,7 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
         await ws.accept()
 
         s = current()
-        service = CallAgentService(s)
+        service = service_for(s)
 
         async def heartbeat() -> None:
             await ws.send_json({"type": "heartbeat"})
@@ -509,7 +568,7 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
             Switching agent switches Target (``<agent>-<external_id>``), so each
             agent keeps its own thread rather than inheriting the last one's —
             which is the only sane reading of "call someone else"."""
-            svc = CallAgentService(settings)
+            svc = service_for(settings)
             sid: str | None = None
             async with svc.client(timeout=15.0) as client:
                 await svc.ensure_target(client)
@@ -581,7 +640,7 @@ def build_routes(config_provider: Callable[[], dict] | None = None,
                 # Re-read config every turn (a settings save mid-call should
                 # apply), but keep whichever agent this socket is bound to.
                 s = dataclasses.replace(current(), agent_slug=s.agent_slug)
-                service = CallAgentService(s)
+                service = service_for(s)
                 prompt = s.build_prompt(user_text)
 
                 try:
