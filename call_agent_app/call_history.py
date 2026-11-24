@@ -57,6 +57,10 @@ class CallStore:
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Call metadata is rewritten on every 20 ms audio frame from the event
+        # loop; an fsync per commit stalls media on slow disks (100-200 ms each
+        # on CI runners). Recordings and history are not durability-critical.
+        conn.execute("PRAGMA synchronous=OFF")
         return conn
 
     def _init_db(self):
